@@ -62,11 +62,6 @@ contains fixed-size lookup nodes whose string-pool offsets must be preserved or
 remapped when text lengths change. This tool retains the untouched binary
 template and rebuilds only the localization pool and its affected references.
 
-A locally supplied English corpus reproduces byte-for-byte after an unchanged
-extract/repack cycle. Automated tests also cover both longer and shorter edits.
-Original game data is used only for local validation and is not distributed in
-this repository.
-
 ## Building the executable
 
 ```powershell
