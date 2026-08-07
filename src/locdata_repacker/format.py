@@ -6,7 +6,7 @@ import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 
 FORMAT_NAME = "fantasy-wars-locdata-v1"
@@ -20,6 +20,26 @@ KEY_XOR = 0xCD
 VALUE_XOR = 0xAD
 MAX_ENTRIES = 100_000
 KEY_PATTERN = re.compile(r"#[A-Z0-9_]+\Z")
+KEY_PATTERN_BYTES = re.compile(rb"#[A-Z0-9_]+\Z")
+
+# The Western and Russian releases both store single-byte text, but in different
+# code pages. Both are byte-preserving across a decode/encode round trip, so a
+# misdetection can never corrupt an unedited file; it only makes the text
+# unreadable while editing.
+DEFAULT_ENCODING = "cp1252"
+SUPPORTED_ENCODINGS = ("cp1252", "cp1251")
+ENCODING_LABELS = {"cp1252": "Windows-1252 (Western)", "cp1251": "Windows-1251 (Cyrillic)"}
+
+# Byte values each code page leaves undefined. Hitting one is proof the other
+# code page is in use.
+_UNDEFINED = {"cp1252": frozenset((0x81, 0x8D, 0x8F, 0x90, 0x9D)), "cp1251": frozenset((0x98,))}
+
+# In Windows-1251 the Russian alphabet occupies 0xC0-0xFF, with 0xA8/0xB8 for
+# Yo. Western text uses the high range only for isolated punctuation, so both
+# the share of alphabet bytes and their run length separate the two cleanly.
+_CYRILLIC_ALPHABET = frozenset(range(0xC0, 0x100)) | {0xA8, 0xB8}
+_CYRILLIC_SHARE_THRESHOLD = 0.60
+_CYRILLIC_RUN_THRESHOLD = 2.0
 
 
 class LocdataFormatError(ValueError):
@@ -37,32 +57,101 @@ class LocdataFile:
     entries: Tuple[LocdataEntry, ...]
     template: bytes
     source_name: str = "locdata.md"
+    encoding: str = DEFAULT_ENCODING
 
 
 def _xor(data: bytes, mask: int) -> bytes:
     return bytes(value ^ mask for value in data)
 
 
-def _decode(data: bytes, label: str) -> str:
+def normalize_encoding(value: Any, label: str = "Encoding") -> str:
+    if not isinstance(value, str):
+        raise LocdataFormatError("{} must be named as text.".format(label))
+    normalized = value.strip().lower().replace("-", "").replace("_", "")
+    aliases = {
+        "cp1252": "cp1252", "windows1252": "cp1252", "1252": "cp1252", "western": "cp1252",
+        "cp1251": "cp1251", "windows1251": "cp1251", "1251": "cp1251", "cyrillic": "cp1251",
+        "russian": "cp1251",
+    }
+    if normalized not in aliases:
+        raise LocdataFormatError(
+            "{} must be one of {}, got {!r}.".format(label, ", ".join(SUPPORTED_ENCODINGS), value)
+        )
+    return aliases[normalized]
+
+
+def _decode(data: bytes, label: str, encoding: str = DEFAULT_ENCODING) -> str:
     try:
-        return data.decode("cp1252")
+        return data.decode(encoding)
     except UnicodeDecodeError as exc:
         raise LocdataFormatError(
-            "{} contains bytes that cannot be decoded as Windows-1252.".format(label)
+            "{} contains bytes that cannot be decoded as {}.".format(
+                label, ENCODING_LABELS.get(encoding, encoding)
+            )
         ) from exc
 
 
-def _encode(text: str, label: str) -> bytes:
+def _encode(text: str, label: str, encoding: str = DEFAULT_ENCODING) -> bytes:
     if not isinstance(text, str):
         raise LocdataFormatError("{} must be text.".format(label))
     if "\0" in text:
         raise LocdataFormatError("{} contains an embedded NUL character.".format(label))
     try:
-        return text.encode("cp1252")
+        return text.encode(encoding)
     except UnicodeEncodeError as exc:
         raise LocdataFormatError(
-            "{} contains a character the game cannot represent in Windows-1252.".format(label)
+            "{} contains a character the game cannot represent in {}.".format(
+                label, ENCODING_LABELS.get(encoding, encoding)
+            )
         ) from exc
+
+
+def _value_blob(data: bytes) -> bytes:
+    """Concatenate the value segments, skipping keys, without needing a codec."""
+    segments, _starts, _count = _segments(data)
+    values: List[bytes] = []
+    index = 0
+    while index < len(segments):
+        index += 1
+        if index < len(segments):
+            if not KEY_PATTERN_BYTES.fullmatch(_xor(segments[index], KEY_XOR)):
+                values.append(_xor(segments[index], VALUE_XOR))
+                index += 1
+    return b"".join(values)
+
+
+def detect_encoding(data: bytes) -> str:
+    """Guess the code page of a binary locdata container."""
+    blob = _value_blob(data)
+    present = set(blob)
+    # An undefined byte in one code page is decisive evidence for the other.
+    cp1252_impossible = bool(present & _UNDEFINED["cp1252"])
+    cp1251_impossible = bool(present & _UNDEFINED["cp1251"])
+    if cp1252_impossible and not cp1251_impossible:
+        return "cp1251"
+    if cp1251_impossible and not cp1252_impossible:
+        return "cp1252"
+
+    high = [byte for byte in blob if byte > 0x7F]
+    if not high:
+        return DEFAULT_ENCODING
+    share = sum(1 for byte in high if byte in _CYRILLIC_ALPHABET) / len(high)
+
+    runs: List[int] = []
+    current = 0
+    for byte in blob:
+        if byte > 0x7F:
+            current += 1
+        elif current:
+            runs.append(current)
+            current = 0
+    if current:
+        runs.append(current)
+    mean_run = sum(runs) / len(runs) if runs else 0.0
+
+    if share >= _CYRILLIC_SHARE_THRESHOLD and mean_run >= _CYRILLIC_RUN_THRESHOLD:
+        return "cp1251"
+    return DEFAULT_ENCODING
 
 
 def _layout(data: bytes) -> Tuple[int, int, int]:
@@ -96,29 +185,32 @@ def _segments(data: bytes) -> Tuple[List[bytes], List[int], int]:
     return values, starts, entry_count
 
 
-def unpack_locdata(path: PathLike) -> LocdataFile:
+def unpack_locdata(path: PathLike, encoding: Optional[str] = None) -> LocdataFile:
     source = Path(path)
     data = source.read_bytes()
+    codec = detect_encoding(data) if encoding is None else normalize_encoding(encoding)
     segments, _starts, expected_count = _segments(data)
     entries: List[LocdataEntry] = []
     index = 0
     while index < len(segments):
         key_raw = _xor(segments[index], KEY_XOR)
-        key = _decode(key_raw, "Localization key at segment {}".format(index))
-        if not KEY_PATTERN.fullmatch(key):
+        # Keys are ASCII by construction, so this probe stays codec-independent.
+        # Decoding it would misfire on value bytes the code page leaves undefined.
+        if not KEY_PATTERN_BYTES.fullmatch(key_raw):
             raise LocdataFormatError(
                 "Expected a localization key at string-pool segment {}, got {!r}.".format(
-                    index, key[:80]
+                    index, key_raw[:80]
                 )
             )
+        key = key_raw.decode("ascii")
         index += 1
         text = ""
         if index < len(segments):
-            possible_key = _decode(_xor(segments[index], KEY_XOR), "String-pool segment")
-            if not KEY_PATTERN.fullmatch(possible_key):
+            if not KEY_PATTERN_BYTES.fullmatch(_xor(segments[index], KEY_XOR)):
                 text = _decode(
                     _xor(segments[index], VALUE_XOR),
                     "Text for {!r}".format(key),
+                    codec,
                 )
                 index += 1
         entries.append(LocdataEntry(key, text))
@@ -130,7 +222,7 @@ def unpack_locdata(path: PathLike) -> LocdataFile:
         )
     if len({entry.key for entry in entries}) != len(entries):
         raise LocdataFormatError("The localization file contains duplicate keys.")
-    return LocdataFile(tuple(entries), data, source.name)
+    return LocdataFile(tuple(entries), data, source.name, codec)
 
 
 def write_editable(document: LocdataFile, path: PathLike) -> None:
@@ -141,6 +233,7 @@ def write_editable(document: LocdataFile, path: PathLike) -> None:
         "instructions": "Edit only the text values. Keep keys and their order unchanged.",
         "source_file": document.source_name,
         "source_sha256": hashlib.sha256(document.template).hexdigest(),
+        "encoding": document.encoding,
         "template_file": template_path.name,
         "entries": [
             {"key": entry.key, "text": entry.text} for entry in document.entries
@@ -185,7 +278,12 @@ def read_editable(path: PathLike) -> LocdataFile:
     declared_hash = payload.get("source_sha256")
     if declared_hash != hashlib.sha256(template).hexdigest():
         raise LocdataFormatError("The companion template checksum does not match.")
-    original = unpack_locdata_bytes(template, str(payload.get("source_file", "locdata.md")))
+    # Files written before code-page support carry no marker and were always
+    # Windows-1252, so the default keeps them repacking unchanged.
+    codec = normalize_encoding(payload.get("encoding", DEFAULT_ENCODING), "Declared encoding")
+    original = unpack_locdata_bytes(
+        template, str(payload.get("source_file", "locdata.md")), codec
+    )
     raw_entries = payload.get("entries")
     if not isinstance(raw_entries, list) or len(raw_entries) != len(original.entries):
         raise LocdataFormatError(
@@ -203,30 +301,33 @@ def read_editable(path: PathLike) -> LocdataFile:
             )
         if not isinstance(text, str):
             raise LocdataFormatError("Text for {!r} must be a string.".format(key))
-        _encode(text, "Text for {!r}".format(key))
+        _encode(text, "Text for {!r}".format(key), codec)
         entries.append(LocdataEntry(key, text))
-    return LocdataFile(tuple(entries), template, original.source_name)
+    return LocdataFile(tuple(entries), template, original.source_name, codec)
 
 
-def unpack_locdata_bytes(data: bytes, source_name: str = "locdata.md") -> LocdataFile:
+def unpack_locdata_bytes(
+    data: bytes, source_name: str = "locdata.md", encoding: Optional[str] = None
+) -> LocdataFile:
+    codec = detect_encoding(data) if encoding is None else normalize_encoding(encoding)
     segments, _starts, expected_count = _segments(data)
     entries: List[LocdataEntry] = []
     index = 0
     while index < len(segments):
-        key = _decode(_xor(segments[index], KEY_XOR), "Localization key")
-        if not KEY_PATTERN.fullmatch(key):
-            raise LocdataFormatError("Invalid localization key {!r}.".format(key[:80]))
+        key_raw = _xor(segments[index], KEY_XOR)
+        if not KEY_PATTERN_BYTES.fullmatch(key_raw):
+            raise LocdataFormatError("Invalid localization key {!r}.".format(key_raw[:80]))
+        key = key_raw.decode("ascii")
         index += 1
         text = ""
         if index < len(segments):
-            candidate = _decode(_xor(segments[index], KEY_XOR), "String-pool segment")
-            if not KEY_PATTERN.fullmatch(candidate):
-                text = _decode(_xor(segments[index], VALUE_XOR), "Text for {!r}".format(key))
+            if not KEY_PATTERN_BYTES.fullmatch(_xor(segments[index], KEY_XOR)):
+                text = _decode(_xor(segments[index], VALUE_XOR), "Text for {!r}".format(key), codec)
                 index += 1
         entries.append(LocdataEntry(key, text))
     if len(entries) != expected_count:
         raise LocdataFormatError("Localization entry count does not match the header.")
-    return LocdataFile(tuple(entries), data, source_name)
+    return LocdataFile(tuple(entries), data, source_name, codec)
 
 
 def _boundary_map(old_segments: Sequence[bytes], new_segments: Sequence[bytes]):
@@ -267,7 +368,8 @@ def _boundary_map(old_segments: Sequence[bytes], new_segments: Sequence[bytes]):
 
 
 def pack_locdata(document: LocdataFile, path: PathLike) -> None:
-    original = unpack_locdata_bytes(document.template, document.source_name)
+    codec = normalize_encoding(document.encoding)
+    original = unpack_locdata_bytes(document.template, document.source_name, codec)
     if len(document.entries) != len(original.entries):
         raise LocdataFormatError("The number of localization entries cannot be changed.")
     for current, expected in zip(document.entries, original.entries):
@@ -277,9 +379,11 @@ def pack_locdata(document: LocdataFile, path: PathLike) -> None:
     old_segments, _old_starts, _count = _segments(document.template)
     new_segments: List[bytes] = []
     for entry in document.entries:
-        new_segments.append(_xor(_encode(entry.key, "Localization key"), KEY_XOR))
+        new_segments.append(_xor(_encode(entry.key, "Localization key", codec), KEY_XOR))
         if entry.text:
-            new_segments.append(_xor(_encode(entry.text, "Text for {!r}".format(entry.key)), VALUE_XOR))
+            new_segments.append(
+                _xor(_encode(entry.text, "Text for {!r}".format(entry.key), codec), VALUE_XOR)
+            )
 
     translate, old_end, new_end = _boundary_map(old_segments, new_segments)
     if new_end > len(document.template):

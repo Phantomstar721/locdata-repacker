@@ -5,7 +5,11 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .cli import repack_file, unpack_file
-from .format import LocdataFormatError
+from .format import ENCODING_LABELS, SUPPORTED_ENCODINGS, LocdataFormatError
+
+AUTO_LABEL = "Detect automatically (recommended)"
+ENCODING_CHOICES = [AUTO_LABEL] + [ENCODING_LABELS[name] for name in SUPPORTED_ENCODINGS]
+_LABEL_TO_ENCODING = {ENCODING_LABELS[name]: name for name in SUPPORTED_ENCODINGS}
 
 
 class RepackerApp:
@@ -18,6 +22,7 @@ class RepackerApp:
         self.unpack_target = tk.StringVar()
         self.repack_source = tk.StringVar()
         self.repack_target = tk.StringVar()
+        self.unpack_encoding = tk.StringVar(value=AUTO_LABEL)
         self.status = tk.StringVar(value="Choose an operation and select your files.")
 
         outer = ttk.Frame(root, padding=18)
@@ -35,7 +40,7 @@ class RepackerApp:
         tabs.add(repack_tab, text="  Repack .txt  ")
         self._operation(unpack_tab, "Source locdata.md", self.unpack_source, self._browse_unpack_source,
                         "Target editable .txt", self.unpack_target, self._browse_unpack_target,
-                        "Extract localization", self._unpack)
+                        "Extract localization", self._unpack, self._encoding_row)
         self._operation(repack_tab, "Source edited .txt", self.repack_source, self._browse_repack_source,
                         "Target locdata.md", self.repack_target, self._browse_repack_target,
                         "Repack localization", self._repack)
@@ -44,7 +49,8 @@ class RepackerApp:
         ttk.Label(status_frame, textvariable=self.status, wraplength=700).pack(anchor="w")
 
     def _operation(self, parent, source_label, source_var, source_command,
-                   target_label, target_var, target_command, button_text, button_command) -> None:
+                   target_label, target_var, target_command, button_text, button_command,
+                   extra=None) -> None:
         parent.columnconfigure(0, weight=1)
         ttk.Label(parent, text=source_label).grid(row=0, column=0, sticky="w")
         source_row = ttk.Frame(parent)
@@ -58,7 +64,18 @@ class RepackerApp:
         target_row.columnconfigure(0, weight=1)
         ttk.Entry(target_row, textvariable=target_var).grid(row=0, column=0, sticky="ew")
         ttk.Button(target_row, text="Browse...", command=target_command).grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(parent, text=button_text, command=button_command).grid(row=4, column=0, sticky="e")
+        next_row = extra(parent, 4) if extra else 4
+        ttk.Button(parent, text=button_text, command=button_command).grid(row=next_row, column=0, sticky="e")
+
+    def _encoding_row(self, parent, row: int) -> int:
+        ttk.Label(parent, text="Text encoding").grid(row=row, column=0, sticky="w")
+        ttk.Combobox(
+            parent,
+            textvariable=self.unpack_encoding,
+            values=ENCODING_CHOICES,
+            state="readonly",
+        ).grid(row=row + 1, column=0, sticky="ew", pady=(4, 20))
+        return row + 2
 
     def _browse_unpack_source(self) -> None:
         value = filedialog.askopenfilename(title="Select locdata.md", filetypes=(("Locdata files", "*.md"), ("All files", "*.*")))
@@ -97,13 +114,22 @@ class RepackerApp:
     def _unpack(self) -> None:
         try:
             source, target = self._paths(self.unpack_source.get(), self.unpack_target.get())
-            count = unpack_file(source, target)
+            chosen = _LABEL_TO_ENCODING.get(self.unpack_encoding.get())
+            count, encoding = unpack_file(source, target, chosen)
             template = target.with_suffix(".template")
-            self.status.set("Extracted {:,} entries to {} (template: {})".format(count, target, template.name))
+            described = "{} ({})".format(
+                ENCODING_LABELS[encoding], "forced" if chosen else "detected"
+            )
+            self.status.set(
+                "Extracted {:,} entries to {} (template: {}, encoding: {})".format(
+                    count, target, template.name, described
+                )
+            )
             messagebox.showinfo(
                 "Extraction complete",
-                "Wrote {:,} editable entries.\n\nKeep {} beside the text file for repacking.".format(
-                    count, template.name
+                "Wrote {:,} editable entries.\nEncoding: {}\n\n"
+                "Keep {} beside the text file for repacking.".format(
+                    count, described, template.name
                 ),
             )
         except InterruptedError:
@@ -115,9 +141,16 @@ class RepackerApp:
     def _repack(self) -> None:
         try:
             source, target = self._paths(self.repack_source.get(), self.repack_target.get())
-            count = repack_file(source, target)
-            self.status.set("Repacked {:,} entries to {}".format(count, target))
-            messagebox.showinfo("Repack complete", "Wrote {:,} localization entries.".format(count))
+            count, encoding = repack_file(source, target)
+            self.status.set(
+                "Repacked {:,} entries to {} ({})".format(count, target, ENCODING_LABELS[encoding])
+            )
+            messagebox.showinfo(
+                "Repack complete",
+                "Wrote {:,} localization entries.\nEncoding: {}".format(
+                    count, ENCODING_LABELS[encoding]
+                ),
+            )
         except InterruptedError:
             return
         except (OSError, LocdataFormatError) as exc:
